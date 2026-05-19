@@ -157,6 +157,10 @@ class App:
         return 12 + (2 + n_conn) * self.line_h + 12
 
     def _apply_geometry(self, w, h, x, y):
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = max(0, min(x, sw - w))
+        y = max(0, min(y, sh - h))
         self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     def tick(self):
