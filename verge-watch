@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Clash Verge 流量监视小窗：PROXY/DIRECT 实时下载速度+累计 + 大流量 host 明细。
+
+控制：左键拖动；右键关闭。
+"""
+
+import json
+import socket
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+
+SOCK = "/tmp/verge/verge-mihomo.sock"
+POLL_MS = 1000
+
+RATE_HIDE = 10 * 1024            # 速度低于此值显示 "闲置"
+ACTIVE_RATE = 1 * 1024 * 1024    # host 速度高于此值才出现在明细里
+HOST_TRUNC = 24                  # 主机名最长字符数（含省略号）
+MAX_ROWS = 10                    # 明细最多显示行数
+
+FONT_FAM = "DejaVu Sans Mono"
+FONT_SIZE = 14
+BG = "#1a1a1a"
+DIRECT_COLOR = "#88cc88"
+
+
+def http_get(path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2)
+    try:
+        s.connect(SOCK)
+        s.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode()
+        )
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    sep = buf.find(b"\r\n\r\n")
+    if sep < 0:
+        raise RuntimeError("bad http response")
+    headers = buf[:sep].decode("latin-1", "ignore").lower()
+    body = buf[sep + 4 :]
+    if "transfer-encoding: chunked" in headers:
+        out, i = b"", 0
+        while i < len(body):
+            j = body.find(b"\r\n", i)
+            if j < 0:
+                break
+            try:
+                size = int(body[i:j], 16)
+            except ValueError:
+                break
+            if size == 0:
+                break
+            i = j + 2
+            out += body[i : i + size]
+            i += size + 2
+        body = out
+    return json.loads(body)
+
+
+def human_rate(n):
+    if n < RATE_HIDE:
+        return ""
+    for u in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.1f} {u}/s"
+        n /= 1024
+    return f"{n:.1f} T/s"
+
+
+def human_total(n):
+    for u in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} T"
+
+
+def trunc(s, n):
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+class App:
+    def __init__(self):
+        self.prev = {}                # cid -> (upload, download)
+        self.last_t = time.monotonic()
+        self.tot_p_dn = 0
+        self.tot_d_dn = 0
+
+        r = tk.Tk()
+        self.root = r
+        r.title("verge-watch")
+        r.overrideredirect(True)
+        r.attributes("-topmost", True)
+        r.attributes("-alpha", 0.88)
+        r.configure(bg=BG)
+
+        f = tkfont.Font(family=FONT_FAM, size=FONT_SIZE, weight="bold")
+        self.line_h = f.metrics("linespace")
+        self.font = (FONT_FAM, FONT_SIZE, "bold")
+
+        def cell_padx(col):
+            return (12, 4) if col == 0 else ((4, 4) if col == 1 else (4, 12))
+
+        self._cell_padx = cell_padx
+
+        def mklbl(row, col, color):
+            l = tk.Label(r, text="", font=self.font, bg=BG, fg=color, anchor="w")
+            l.grid(row=row, column=col, sticky="w", padx=cell_padx(col), pady=1)
+            return l
+
+        self.lbl_p_n = mklbl(0, 0, "#ffaa55")
+        self.lbl_p_r = mklbl(0, 1, "#ffaa55")
+        self.lbl_p_t = mklbl(0, 2, "#ffaa55")
+        self.lbl_p_n.config(text="PROXY")
+
+        self.lbl_d_n = mklbl(1, 0, DIRECT_COLOR)
+        self.lbl_d_r = mklbl(1, 1, DIRECT_COLOR)
+        self.lbl_d_t = mklbl(1, 2, DIRECT_COLOR)
+        self.lbl_d_n.config(text="DIRECT")
+
+        self.conn_widgets = []  # list of (lbl_host, lbl_rate, lbl_total)
+        self._color_p = "#888888"
+
+        sw = r.winfo_screenwidth()
+        r.update_idletasks()
+        init_w = max(r.winfo_reqwidth(), 200)
+        self._apply_geometry(init_w, self._height_for(0),
+                             sw - init_w - 20, 40)
+
+        for w in (r, self.lbl_p_n, self.lbl_p_r, self.lbl_p_t,
+                  self.lbl_d_n, self.lbl_d_r, self.lbl_d_t):
+            self._bind_drag(w)
+
+        self.tick()
+        r.mainloop()
+
+    def _bind_drag(self, w):
+        w.bind("<Button-1>", self._drag_start)
+        w.bind("<B1-Motion>", self._drag_move)
+        w.bind("<Button-3>", lambda e: self.root.destroy())
+
+    def _drag_start(self, e):
+        self._dx = e.x_root - self.root.winfo_x()
+        self._dy = e.y_root - self.root.winfo_y()
+
+    def _drag_move(self, e):
+        self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+
+    def _height_for(self, n_conn):
+        return 12 + (2 + n_conn) * self.line_h + 12
+
+    def _apply_geometry(self, w, h, x, y):
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def tick(self):
+        try:
+            data = http_get("/connections")
+            now = time.monotonic()
+            dt = max(now - self.last_t, 0.001)
+            self.last_t = now
+
+            host_rate = {}
+            host_total = {}
+            host_proxy = {}
+            sp_dn_p = 0
+            sp_dn_d = 0
+            seen = set()
+
+            for c in data.get("connections") or []:
+                cid = c["id"]
+                md = c.get("metadata") or {}
+                host = md.get("host") or md.get("destinationIP") or "?"
+                up = c.get("upload", 0)
+                dn = c.get("download", 0)
+                is_proxy = "DIRECT" not in c.get("chains", [])
+                seen.add(cid)
+
+                rate_dn = 0
+                p = self.prev.get(cid)
+                if p:
+                    d_dn = max(dn - p[1], 0)
+                    rate_dn = d_dn / dt
+                    if is_proxy:
+                        sp_dn_p += rate_dn
+                        self.tot_p_dn += d_dn
+                    else:
+                        sp_dn_d += rate_dn
+                        self.tot_d_dn += d_dn
+                self.prev[cid] = (up, dn)
+
+                host_rate[host] = host_rate.get(host, 0) + rate_dn
+                host_total[host] = host_total.get(host, 0) + dn
+                host_proxy[host] = host_proxy.get(host, False) or is_proxy
+
+            for cid in list(self.prev):
+                if cid not in seen:
+                    del self.prev[cid]
+
+            if sp_dn_p > 500 * 1024:
+                color_p = "#ff5555"
+            elif sp_dn_p > 50 * 1024:
+                color_p = "#ffaa55"
+            else:
+                color_p = "#888888"
+            self._color_p = color_p
+            for l in (self.lbl_p_n, self.lbl_p_r, self.lbl_p_t):
+                l.config(fg=color_p)
+            self.lbl_p_r.config(text=human_rate(sp_dn_p))
+            self.lbl_p_t.config(text=human_total(self.tot_p_dn))
+            self.lbl_d_r.config(text=human_rate(sp_dn_d))
+            self.lbl_d_t.config(text=human_total(self.tot_d_dn))
+
+            active = [
+                (h, host_rate[h], host_total[h], host_proxy[h])
+                for h in host_rate
+                if host_rate[h] > ACTIVE_RATE
+            ]
+            active.sort(key=lambda x: -x[1])
+            active = active[:MAX_ROWS]
+
+            while len(self.conn_widgets) > len(active):
+                ws = self.conn_widgets.pop()
+                for w in ws:
+                    w.destroy()
+            while len(self.conn_widgets) < len(active):
+                i = len(self.conn_widgets)
+                row = 2 + i
+                ws = []
+                for col in range(3):
+                    l = tk.Label(self.root, text="", font=self.font, bg=BG, anchor="w")
+                    l.grid(row=row, column=col, sticky="w", padx=self._cell_padx(col), pady=1)
+                    self._bind_drag(l)
+                    ws.append(l)
+                self.conn_widgets.append(tuple(ws))
+
+            for i, (host, rate, total, is_proxy) in enumerate(active):
+                color = self._color_p if is_proxy else DIRECT_COLOR
+                ws = self.conn_widgets[i]
+                ws[0].config(text=trunc(host, HOST_TRUNC), fg=color)
+                ws[1].config(text=human_rate(rate), fg=color)
+                ws[2].config(text=human_total(total), fg=color)
+
+            self.root.update_idletasks()
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            new_w = max(self.root.winfo_reqwidth(), 200)
+            self._apply_geometry(new_w, self._height_for(len(active)), x, y)
+
+        except Exception as e:
+            self.lbl_p_n.config(text="err", fg="#ff5555")
+            self.lbl_p_r.config(text=str(e)[:30], fg="#ff5555")
+            self.lbl_p_t.config(text="")
+
+        self.root.after(POLL_MS, self.tick)
+
+
+if __name__ == "__main__":
+    App()
